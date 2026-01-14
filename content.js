@@ -1,3 +1,5 @@
+// content.js - 平衡响应速度与稳定性
+
 const DEFAULTS = {
   enabled: true,
   windowMinutes: 120,
@@ -23,16 +25,23 @@ const i18n = {
 let cfg = { ...DEFAULTS };
 let currentLang = "en";
 
-// key -> { firstAddr, firstAgeMs, firstSlotIndex, firstChain }
-let firstIndex = new Map();
-let dupKeys = new Set();
-// 改进的缓存结构：addrKey -> { isFirst, markerType, lang, firstInfo }
-let processedCache = new Map();
-let hiddenSlots = new Map();
+// 稳定索引
+let stableFirstIndex = new Map();
+let stableDupKeys = new Set();
 
-// 防抖/节流控制
+// 已处理元素缓存
+let elementStateCache = new WeakMap();
+// 已知地址集合 - 用于判断是否为新元素
+let knownAddresses = new Set();
+
+// 处理控制
 let isProcessing = false;
 let pendingScan = false;
+let scanGeneration = 0;
+
+// 区分快速扫描和完整扫描
+let lastFullScanTime = 0;
+const FULL_SCAN_INTERVAL = 500;
 
 function detectLanguage() {
   const browserLang = navigator.language || navigator.userLanguage || "en";
@@ -46,8 +55,7 @@ function getCurrentLang() {
 }
 
 function t(key) {
-  const lang = currentLang;
-  return i18n[lang]?.[key] || i18n.en[key] || key;
+  return i18n[currentLang]?.[key] || i18n.en[key] || key;
 }
 
 function normalize(s) {
@@ -88,34 +96,26 @@ function buildKeys({ symbol, name }) {
   return keys;
 }
 
-/**
- * 适配新页面结构的 Symbol 和 Name 提取
- */
 function extractSymbolAndName(rowEl) {
   let symbol = "";
   let name = "";
 
-  // 尝试多种选择器来获取 Symbol
-  // 方式1: span.whitespace-nowrap.font-medium (原有)
   let symbolEl = rowEl.querySelector("span.whitespace-nowrap.font-medium");
   if (symbolEl) {
     symbol = (symbolEl.textContent || "").trim();
   }
 
-  // 方式2: 查找包含 token symbol 的元素（新结构）
   if (!symbol) {
-    // 在新结构中，symbol 通常在第一个 font-medium 的 span 中
     const symbolCandidates = rowEl.querySelectorAll('span.font-medium[class*="text-[16px]"]');
     for (const el of symbolCandidates) {
       const text = (el.textContent || "").trim();
-      if (text && text.length < 20) { // symbol 通常比较短
+      if (text && text.length < 20) {
         symbol = text;
         break;
       }
     }
   }
 
-  // 方式3: 查找第一个 text-[16px] font-medium
   if (!symbol) {
     const el = rowEl.querySelector('[class*="text-[16px]"][class*="font-medium"]');
     if (el) {
@@ -123,20 +123,15 @@ function extractSymbolAndName(rowEl) {
     }
   }
 
-  // 尝试多种选择器来获取 Name
-  // 方式1: div.text-text-300.font-medium (原有)
   let nameEl = rowEl.querySelector("div.text-text-300.font-medium");
   if (nameEl) {
     name = (nameEl.textContent || "").trim();
   }
 
-  // 方式2: 查找包含 name 的元素（新结构）
   if (!name) {
-    // 在新结构中，name 通常在 text-text-300 的 div 中，且在 symbol 后面
     const nameCandidates = rowEl.querySelectorAll('div[class*="text-text-300"]');
     for (const el of nameCandidates) {
       const text = (el.textContent || "").trim();
-      // 排除太短的文本和纯数字/符号
       if (text && text.length > 1 && text !== symbol && !/^[\d.%]+$/.test(text)) {
         name = text;
         break;
@@ -144,7 +139,6 @@ function extractSymbolAndName(rowEl) {
     }
   }
 
-  // 方式3: 查找 truncate 类的元素
   if (!name) {
     const el = rowEl.querySelector('[class*="truncate"][class*="text-[14px]"]');
     if (el) {
@@ -155,18 +149,12 @@ function extractSymbolAndName(rowEl) {
   return { symbol, name };
 }
 
-/**
- * 适配新页面结构的 Age 提取
- */
 function extractAge(rowEl) {
-  // 方式1: 查找 text-green-50 或 text-green-100 类（原有）
   const ageSelectors = [
     '.text-green-50',
     '.text-green-100',
     '[class*="text-green-50"]',
-    '[class*="text-green-100"]',
-    'div.text-green-50',
-    'div.text-green-100'
+    '[class*="text-green-100"]'
   ];
 
   for (const selector of ageSelectors) {
@@ -179,11 +167,9 @@ function extractAge(rowEl) {
     }
   }
 
-  // 方式2: 遍历所有可能包含时间的元素
   const candidates = rowEl.querySelectorAll("div, span, p");
   for (const el of candidates) {
     const txt = (el.textContent || "").trim();
-    // 匹配 "33s", "42s", "1m", "2h" 等格式
     if (/^\d+\s*[smhd]$/i.test(txt)) {
       return txt;
     }
@@ -192,19 +178,13 @@ function extractAge(rowEl) {
   return null;
 }
 
-/**
- * 获取行元素 - 适配新结构
- */
 function getRowElement(slot) {
-  // 方式1: 原有选择器
   let rowEl = slot.querySelector('div[href^="/"][href*="/token/"]');
   
-  // 方式2: 新结构 - 查找具有 href 属性的 div
   if (!rowEl) {
     rowEl = slot.querySelector('div[href*="/token/"]');
   }
 
-  // 方式3: 查找 class 包含 cursor-pointer 且有 href 的 div
   if (!rowEl) {
     const candidates = slot.querySelectorAll('div[href]');
     for (const el of candidates) {
@@ -216,14 +196,11 @@ function getRowElement(slot) {
     }
   }
 
-  // 方式4: 查找最外层的可点击行元素
   if (!rowEl) {
     rowEl = slot.querySelector('div[class*="cursor-pointer"][class*="group/a"]');
-    // 如果找到，检查是否能从子元素获取 href
     if (rowEl) {
       const linkEl = rowEl.querySelector('a[href*="/token/"]');
       if (linkEl) {
-        // 将 href 设置到 rowEl 的数据属性中供后续使用
         rowEl.setAttribute('data-token-href', linkEl.getAttribute('href'));
       }
     }
@@ -232,19 +209,13 @@ function getRowElement(slot) {
   return rowEl;
 }
 
-/**
- * 从行元素提取 token 信息
- */
 function extractTokenFromRow(rowEl, slot) {
-  // 尝试多种方式获取 href
   let href = rowEl.getAttribute("href") || "";
   
-  // 如果没有 href，尝试从 data 属性获取
   if (!href) {
     href = rowEl.getAttribute("data-token-href") || "";
   }
   
-  // 如果还是没有，尝试从子元素的 a 标签获取
   if (!href) {
     const linkEl = rowEl.querySelector('a[href*="/token/"]');
     if (linkEl) {
@@ -277,7 +248,7 @@ function inWindowByAge(ageMs) {
 
 function getFirstTokenInfo(keys) {
   for (const k of keys) {
-    const rec = firstIndex.get(k);
+    const rec = stableFirstIndex.get(k);
     if (rec) {
       return {
         chain: rec.firstChain,
@@ -300,12 +271,13 @@ function isEarlierThan(tokenAgeMs, tokenSlotIndex, recAgeMs, recSlotIndex) {
 }
 
 /**
- * 创建或更新标记 - 优化版本，减少 DOM 操作
+ * 创建标记容器
  */
 function createMarkerContainer(isFirst, keys) {
   const container = document.createElement("div");
   container.className = "gmgn-marker-container";
   container.setAttribute("data-gmgn-marker", "true");
+  container.setAttribute("data-marker-type", isFirst ? "first" : "dup");
 
   const overlay = document.createElement("div");
   overlay.className = isFirst ? "gmgn-overlay gmgn-overlay-first" : "gmgn-overlay gmgn-overlay-dup";
@@ -333,9 +305,10 @@ function createMarkerContainer(isFirst, keys) {
       gotoBtn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const chain = gotoBtn.getAttribute("data-first-chain");
-        const address = gotoBtn.getAttribute("data-first-address");
-        gotoFirstToken(chain, address);
+        gotoFirstToken(
+          gotoBtn.getAttribute("data-first-chain"),
+          gotoBtn.getAttribute("data-first-address")
+        );
       });
 
       container.appendChild(gotoBtn);
@@ -346,33 +319,30 @@ function createMarkerContainer(isFirst, keys) {
 }
 
 /**
- * 智能更新标记 - 只在必要时操作 DOM
+ * 更新标记 - 优化：只在状态真正变化时操作 DOM
  */
-function updateMarker(rowEl, isFirst, keys, addrKey) {
-  const container = rowEl.querySelector(".gmgn-marker-container");
+function updateMarker(rowEl, isFirst, keys, addrKey, isNewElement) {
+  const cachedState = elementStateCache.get(rowEl);
   const newType = isFirst ? "first" : "dup";
   const firstInfo = isFirst ? null : getFirstTokenInfo(keys);
   const firstInfoKey = firstInfo ? `${firstInfo.chain}:${firstInfo.address}` : "";
   
-  // 检查缓存，判断是否需要更新
-  const cached = processedCache.get(addrKey);
-  if (cached && 
-      cached.markerType === newType && 
-      cached.lang === currentLang &&
-      cached.firstInfoKey === firstInfoKey &&
-      container) {
-    // 状态完全相同，无需更新
+  // 检查是否需要更新
+  if (cachedState && 
+      cachedState.type === newType && 
+      cachedState.lang === currentLang &&
+      cachedState.firstInfoKey === firstInfoKey) {
     return false;
   }
 
-  // 需要更新
-  if (container) {
-    container.remove();
+  // 如果不是新元素，且状态要变化，稍微延迟以避免闪烁
+  // 但新元素立即处理
+  const existingContainer = rowEl.querySelector(".gmgn-marker-container");
+  if (existingContainer) {
+    existingContainer.remove();
   }
 
   const newContainer = createMarkerContainer(isFirst, keys);
-  newContainer.setAttribute("data-type", newType);
-  newContainer.setAttribute("data-lang", currentLang);
 
   const computedStyle = window.getComputedStyle(rowEl);
   if (computedStyle.position === "static") {
@@ -381,13 +351,11 @@ function updateMarker(rowEl, isFirst, keys, addrKey) {
 
   rowEl.appendChild(newContainer);
 
-  // 更新缓存
-  processedCache.set(addrKey, {
-    isFirst,
-    markerType: newType,
+  elementStateCache.set(rowEl, {
+    type: newType,
     lang: currentLang,
     firstInfoKey,
-    timestamp: Date.now()
+    addrKey
   });
 
   return true;
@@ -395,15 +363,17 @@ function updateMarker(rowEl, isFirst, keys, addrKey) {
 
 function removeMarker(rowEl) {
   const container = rowEl.querySelector(".gmgn-marker-container");
-  if (container) container.remove();
+  if (container) {
+    container.remove();
+    elementStateCache.delete(rowEl);
+  }
 }
 
 function relayoutBody(body) {
   const slots = Array.from(body.querySelectorAll("div[data-index]"));
   if (!slots.length) return;
 
-  const slotHeight = 144; // 根据新结构调整高度
-
+  const slotHeight = 144;
   let visibleTop = 0;
 
   slots.sort((a, b) => {
@@ -425,7 +395,6 @@ function relayoutBody(body) {
       slot.style.height = `${slotHeight}px`;
       slot.style.visibility = "";
       slot.style.pointerEvents = "";
-      slot.classList.remove("gmgn-slot-hidden");
       visibleTop += slotHeight;
     }
   }
@@ -437,7 +406,7 @@ function relayoutBody(body) {
 }
 
 function shouldHideSlot(isFirst, keys) {
-  const inDupGroup = keys.some((k) => dupKeys.has(k));
+  const inDupGroup = keys.some((k) => stableDupKeys.has(k));
 
   switch (cfg.showMode) {
     case "all":
@@ -454,7 +423,7 @@ function shouldHideSlot(isFirst, keys) {
 }
 
 /**
- * 第一遍：收集所有 token 信息并建立首发索引
+ * 收集所有 token 并标记新元素
  */
 function collectTokens(body) {
   const slots = body.querySelectorAll("div[data-index]");
@@ -472,6 +441,9 @@ function collectTokens(body) {
     if (!keys.length) continue;
 
     const canCompare = token.ageMs != null && (!cfg.onlyWithinWindow || inWindowByAge(token.ageMs));
+    
+    // 判断是否为新元素
+    const isNewElement = !knownAddresses.has(addrKey);
 
     tokens.push({
       slot,
@@ -479,7 +451,8 @@ function collectTokens(body) {
       token,
       addrKey,
       keys,
-      canCompare
+      canCompare,
+      isNewElement
     });
   }
 
@@ -487,25 +460,24 @@ function collectTokens(body) {
 }
 
 /**
- * 建立首发索引
+ * 构建首发索引 - 完整重建
  */
 function buildFirstIndex(tokens) {
-  // 清空当前索引
-  firstIndex.clear();
-  dupKeys.clear();
+  const newFirstIndex = new Map();
+  const newDupKeys = new Set();
 
   for (const { token, addrKey, keys, canCompare } of tokens) {
     if (!canCompare) continue;
 
     for (const k of keys) {
-      const rec = firstIndex.get(k);
+      const rec = newFirstIndex.get(k);
 
       if (rec && rec.firstAddr !== addrKey) {
-        dupKeys.add(k);
+        newDupKeys.add(k);
       }
 
       if (!rec || isEarlierThan(token.ageMs, token.slotIndex, rec.firstAgeMs, rec.firstSlotIndex)) {
-        firstIndex.set(k, {
+        newFirstIndex.set(k, {
           firstAddr: addrKey,
           firstAgeMs: token.ageMs,
           firstSlotIndex: token.slotIndex,
@@ -514,25 +486,51 @@ function buildFirstIndex(tokens) {
       }
     }
   }
+
+  return { newFirstIndex, newDupKeys };
 }
 
 /**
- * 第二遍：应用标记
+ * 检查索引是否有变化
  */
-function applyMarkers(tokens) {
+function hasIndexChanged(newFirstIndex, newDupKeys) {
+  if (newFirstIndex.size !== stableFirstIndex.size) return true;
+  if (newDupKeys.size !== stableDupKeys.size) return true;
+
+  for (const [k, v] of newFirstIndex) {
+    const old = stableFirstIndex.get(k);
+    if (!old || old.firstAddr !== v.firstAddr) return true;
+  }
+
+  return false;
+}
+
+/**
+ * 判断 token 是否为首发
+ */
+function isTokenFirst(addrKey, keys, firstIndex) {
+  for (const k of keys) {
+    const rec = firstIndex.get(k);
+    if (rec && rec.firstAddr !== addrKey) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * 应用标记
+ */
+function applyMarkers(tokens, firstIndex, dupKeys) {
   let needsRelayout = false;
+  const newKnownAddresses = new Set();
 
-  for (const { slot, rowEl, addrKey, keys, canCompare } of tokens) {
+  for (const { slot, rowEl, addrKey, keys, canCompare, isNewElement } of tokens) {
+    newKnownAddresses.add(addrKey);
+
     let isFirst = true;
-
     if (canCompare) {
-      for (const k of keys) {
-        const rec = firstIndex.get(k);
-        if (rec && rec.firstAddr !== addrKey) {
-          isFirst = false;
-          break;
-        }
-      }
+      isFirst = isTokenFirst(addrKey, keys, firstIndex);
     }
 
     const shouldHide = shouldHideSlot(isFirst, keys);
@@ -548,33 +546,112 @@ function applyMarkers(tokens) {
         slot.classList.remove("gmgn-slot-hidden");
         needsRelayout = true;
       }
-      updateMarker(rowEl, isFirst, keys, addrKey);
+      updateMarker(rowEl, isFirst, keys, addrKey, isNewElement);
     }
   }
+
+  // 更新已知地址集合
+  knownAddresses = newKnownAddresses;
 
   return needsRelayout;
 }
 
 /**
- * 优化后的扫描逻辑 - 两遍扫描避免闪烁
+ * 快速扫描 - 只处理新元素，不重建索引
  */
-function scanBody(body) {
-  // 第一遍：收集所有 token
+function quickScanBody(body) {
+  const slots = body.querySelectorAll("div[data-index]");
+  let hasNewElements = false;
+
+  for (const slot of slots) {
+    const rowEl = getRowElement(slot);
+    if (!rowEl) continue;
+
+    // 检查是否已有标记
+    if (rowEl.querySelector(".gmgn-marker-container")) continue;
+
+    const token = extractTokenFromRow(rowEl, slot);
+    if (!token) continue;
+
+    const addrKey = `${token.chain}:${token.address}`;
+    
+    // 新元素 - 需要完整扫描
+    if (!knownAddresses.has(addrKey)) {
+      hasNewElements = true;
+      break;
+    }
+
+    // 已知元素但没标记 - 直接添加
+    const keys = buildKeys(token);
+    if (!keys.length) continue;
+
+    const canCompare = token.ageMs != null && (!cfg.onlyWithinWindow || inWindowByAge(token.ageMs));
+    let isFirst = true;
+    if (canCompare) {
+      isFirst = isTokenFirst(addrKey, keys, stableFirstIndex);
+    }
+
+    const shouldHide = shouldHideSlot(isFirst, keys);
+    if (!shouldHide) {
+      updateMarker(rowEl, isFirst, keys, addrKey, false);
+    }
+  }
+
+  return hasNewElements;
+}
+
+/**
+ * 完整扫描 - 重建索引并应用标记
+ */
+function fullScanBody(body, generation) {
+  if (generation !== scanGeneration) return;
+
   const tokens = collectTokens(body);
-  
-  // 建立首发索引
-  buildFirstIndex(tokens);
-  
-  // 第二遍：应用标记
-  const needsRelayout = applyMarkers(tokens);
+  const { newFirstIndex, newDupKeys } = buildFirstIndex(tokens);
+
+  // 更新稳定索引
+  stableFirstIndex = newFirstIndex;
+  stableDupKeys = newDupKeys;
+
+  const needsRelayout = applyMarkers(tokens, stableFirstIndex, stableDupKeys);
 
   if (needsRelayout || cfg.showMode !== "all") {
     relayoutBody(body);
   }
 }
 
+/**
+ * 智能扫描 - 根据情况选择快速或完整扫描
+ */
+function smartScan() {
+  if (!cfg.enabled) return;
+  
+  const bodies = document.querySelectorAll(".g-table-body");
+  const now = Date.now();
+  let needFullScan = false;
+
+  // 快速检查是否有新元素
+  for (const body of bodies) {
+    if (quickScanBody(body)) {
+      needFullScan = true;
+      break;
+    }
+  }
+
+  // 有新元素或距离上次完整扫描时间够长，执行完整扫描
+  if (needFullScan || (now - lastFullScanTime > FULL_SCAN_INTERVAL)) {
+    lastFullScanTime = now;
+    scanGeneration++;
+    const currentGeneration = scanGeneration;
+    
+    bodies.forEach((body) => fullScanBody(body, currentGeneration));
+  }
+}
+
+/**
+ * 扫描所有列
+ */
 function scanAllColumns() {
-  // 如果插件被禁用，不执行扫描
   if (!cfg.enabled) return;
   
   if (isProcessing) {
@@ -584,14 +661,12 @@ function scanAllColumns() {
 
   isProcessing = true;
 
-  // 使用 requestAnimationFrame 确保在渲染帧内完成
   requestAnimationFrame(() => {
     try {
-      document.querySelectorAll(".g-table-body").forEach((body) => scanBody(body));
+      smartScan();
     } finally {
       isProcessing = false;
       
-      // 如果有待处理的扫描请求，延迟执行
       if (pendingScan) {
         pendingScan = false;
         setTimeout(scheduleScan, 100);
@@ -601,24 +676,19 @@ function scanAllColumns() {
 }
 
 function resetAll() {
-  firstIndex.clear();
-  dupKeys.clear();
-  processedCache.clear();
-  hiddenSlots.clear();
+  stableFirstIndex.clear();
+  stableDupKeys.clear();
+  knownAddresses.clear();
+  elementStateCache = new WeakMap();
+  lastFullScanTime = 0;
 
   document.querySelectorAll(".gmgn-marker-container").forEach((el) => el.remove());
 
   document.querySelectorAll(".gmgn-slot-hidden").forEach((slot) => {
     slot.classList.remove("gmgn-slot-hidden");
-    const originalTop = slot.getAttribute("data-original-top");
-    if (originalTop) slot.style.top = originalTop;
     slot.style.height = "144px";
     slot.style.visibility = "";
     slot.style.pointerEvents = "";
-  });
-
-  document.querySelectorAll("[data-original-top]").forEach((el) => {
-    el.removeAttribute("data-original-top");
   });
 }
 
@@ -628,15 +698,13 @@ async function loadCfg() {
   currentLang = getCurrentLang();
 }
 
-/* ===================== 扫描调度器 - 优化版 ===================== */
+/* ===================== 扫描调度器 ===================== */
 let scanScheduled = false;
 let lastScanTime = 0;
-const MIN_INTERVAL = 200;
+const MIN_INTERVAL = 100; // 快速响应
 
 function scheduleScan() {
-  // 如果插件被禁用，不调度扫描
   if (!cfg.enabled) return;
-  
   if (scanScheduled) return;
 
   const now = Date.now();
@@ -661,20 +729,36 @@ function scheduleScan() {
   }
 }
 
-// 滚动防抖
 let scrollTimer = null;
-function onScroll(e) {
+function onScroll() {
   if (!cfg.enabled) return;
   clearTimeout(scrollTimer);
-  scrollTimer = setTimeout(() => scheduleScan(), 100);
+  scrollTimer = setTimeout(() => scheduleScan(), 80);
 }
 
-// MutationObserver 防抖
 let mutationTimer = null;
+let mutationCount = 0;
+const MUTATION_BATCH_THRESHOLD = 5;
+
 function onMutation() {
   if (!cfg.enabled) return;
+  
+  mutationCount++;
   clearTimeout(mutationTimer);
-  mutationTimer = setTimeout(() => scheduleScan(), 150);
+  
+  // 如果短时间内有大量变更，稍微延迟以批量处理
+  if (mutationCount >= MUTATION_BATCH_THRESHOLD) {
+    mutationTimer = setTimeout(() => {
+      mutationCount = 0;
+      scheduleScan();
+    }, 150);
+  } else {
+    // 少量变更，快速响应
+    mutationTimer = setTimeout(() => {
+      mutationCount = 0;
+      scheduleScan();
+    }, 50);
+  }
 }
 
 function initObserver() {
@@ -687,7 +771,6 @@ function initObserver() {
     let hasRelevantChange = false;
 
     for (const mutation of mutations) {
-      // 跳过我们自己的标记元素
       if (mutation.target.closest?.(".gmgn-marker-container")) continue;
       if (mutation.target.classList?.contains("gmgn-marker-container")) continue;
 
@@ -723,9 +806,9 @@ function initObserver() {
     if (cfg.enabled) scheduleScan();
   }, { passive: true });
 
-  // 初始扫描（如果启用）
   if (cfg.enabled) {
-    setTimeout(scanAllColumns, 100);
+    // 初始立即扫描
+    scanAllColumns();
   }
 }
 
@@ -742,31 +825,29 @@ function initObserver() {
       await loadCfg();
       resetAll();
       if (cfg.enabled) {
-        setTimeout(scanAllColumns, 100);
+        scanAllColumns();
       }
       return;
     }
 
     await loadCfg();
     
-    // 如果从启用变为禁用
     if (wasEnabled && !cfg.enabled) {
       resetAll();
       return;
     }
     
-    // 如果从禁用变为启用，或者其他设置变更
     if (cfg.enabled) {
       resetAll();
-      setTimeout(scanAllColumns, 100);
+      scanAllColumns();
     }
   });
 
-  // 只有在启用时才定期扫描
+  // 定期扫描保持同步
   setInterval(() => {
     if (cfg.enabled) {
       scheduleScan();
     }
-  }, 1000);
+  }, 800);
 
 })();
