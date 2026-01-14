@@ -23,7 +23,8 @@ const i18n = {
 let cfg = { ...DEFAULTS };
 let currentLang = "en";
 
-// key -> { firstAddr, firstAgeMs, firstChain }
+// key -> { firstAddr, firstAgeMs, firstSlotIndex, firstChain }
+// 优先按 ageMs 判断（越大越早），同秒时按 slotIndex 判断（越大越早）
 let firstIndex = new Map();
 let dupKeys = new Set();
 let processedCache = new Map();
@@ -111,7 +112,7 @@ function extractAge(rowEl) {
   return null;
 }
 
-function extractTokenFromRow(rowEl) {
+function extractTokenFromRow(rowEl, slot) {
   const href = rowEl.getAttribute("href") || "";
   const parsed = parseTokenHref(href);
   if (!parsed) return null;
@@ -119,13 +120,17 @@ function extractTokenFromRow(rowEl) {
   const ageText = extractAge(rowEl);
   const ageMs = parseAgeToMs(ageText);
   const { symbol, name } = extractSymbolAndName(rowEl);
+  
+  // 获取 slot 的 data-index 作为次级排序依据
+  const slotIndex = parseInt(slot?.getAttribute("data-index") || "0", 10);
 
   return {
     chain: parsed.chain,
     address: parsed.address,
     symbol,
     name,
-    ageMs
+    ageMs,
+    slotIndex
   };
 }
 
@@ -151,6 +156,20 @@ function getFirstTokenInfo(keys) {
 function gotoFirstToken(chain, address) {
   const url = `https://gmgn.ai/${chain}/token/${address}`;
   window.open(url, "_blank");
+}
+
+/**
+ * 比较两个 token 谁更早（首发）
+ * 返回 true 表示 tokenA 比 tokenB 更早
+ * 优先比较 ageMs（越大越早），同秒时比较 slotIndex（越大越早）
+ */
+function isEarlierThan(tokenAgeMs, tokenSlotIndex, recAgeMs, recSlotIndex) {
+  // ageMs 越大表示越早创建
+  if (tokenAgeMs > recAgeMs) return true;
+  if (tokenAgeMs < recAgeMs) return false;
+  
+  // ageMs 相同（同一秒），用 slotIndex 判断，越大越早
+  return tokenSlotIndex > recSlotIndex;
 }
 
 /**
@@ -284,7 +303,7 @@ function processSlot(slot, body) {
   const rowEl = slot.querySelector('div[href^="/"][href*="/token/"]');
   if (!rowEl) return { processed: false };
 
-  const token = extractTokenFromRow(rowEl);
+  const token = extractTokenFromRow(rowEl, slot);
   if (!token) {
     removeMarker(rowEl);
     slot.classList.remove("gmgn-slot-hidden");
@@ -300,6 +319,7 @@ function processSlot(slot, body) {
     return { processed: false };
   }
 
+  // 判断是否在时间窗口内
   const canCompare = token.ageMs != null && (!cfg.onlyWithinWindow || inWindowByAge(token.ageMs));
   let isFirst = true;
 
@@ -309,10 +329,12 @@ function processSlot(slot, body) {
 
       if (rec && rec.firstAddr !== addrKey) dupKeys.add(k);
 
-      if (!rec || token.ageMs > rec.firstAgeMs) {
+      // 优先按 ageMs 判断，同秒时按 slotIndex 判断
+      if (!rec || isEarlierThan(token.ageMs, token.slotIndex, rec.firstAgeMs, rec.firstSlotIndex)) {
         firstIndex.set(k, {
           firstAddr: addrKey,
           firstAgeMs: token.ageMs,
+          firstSlotIndex: token.slotIndex,
           firstChain: token.chain
         });
       }
