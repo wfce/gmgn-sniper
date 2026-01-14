@@ -59,12 +59,12 @@
 
 1. 克隆仓库到本地  
    ```bash
-   git clone https://github.com/nicekate/gmgn-filter.git
+   git clone https://github.com/wfce/gmgn-filter.git
    ```
 
 2. 进入项目目录（确认这里包含 manifest.json）  
    ```bash
-   cd gmgn-filter
+   cd gmgn-filter-main
    ```
 
 ### 方式 B：下载 ZIP
