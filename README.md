@@ -35,10 +35,10 @@
 ### 方式 A：使用 git clone
 
 1. 克隆仓库到本地  
-   git clone https://github.com/<YOUR_GITHUB_USERNAME>/<YOUR_REPO_NAME>.git
+   git clone https://github.com/wfce/gmgn-filter.git
 
 2. 进入项目目录（确认这里包含 manifest.json）  
-   cd <YOUR_REPO_NAME>
+   cd gmgn-filter-main
 
 ### 方式 B：下载 ZIP
 
