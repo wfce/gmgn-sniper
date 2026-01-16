@@ -8,8 +8,8 @@ const DEFAULTS = {
   onlyWithinWindow: true,
   language: "auto",
   autoBuyEnabled: false,
-  autoBuyTimeWindow: 10,
-  autoBuyMinDuplicates: 2,
+  autoBuyTimeWindow: 3,
+  autoBuyMinDuplicates: 5,
   stats: {
     autoBuys: 0,
     detections: 0,
@@ -23,14 +23,16 @@ const i18n = {
     firstLaunch: "First",
     notFirst: "Not First",
     gotoFirst: "Open First",
-    autoBought: "Auto Bought First Token!",
+    autoBought: "Auto Bought",
+    clickToView: "Click to view details",
     sniperActive: "Sniper Active"
   },
   zh: {
     firstLaunch: "首发",
     notFirst: "非首发",
     gotoFirst: "打开首发",
-    autoBought: "已自动购买首发代币!",
+    autoBought: "已自动购买",
+    clickToView: "点击查看详情",
     sniperActive: "狙击器已激活"
   }
 };
@@ -57,19 +59,23 @@ let isProcessing = false;
 let pendingScan = false;
 let scanGeneration = 0;
 
-// ========== 自动购买系统 ==========
-let autoBuyTokenHistory = new Map();
-let autoBuyPurchasedTokens = new Set();
-let autoBuyTriggeredKeys = new Set();
-let autoBuyLock = false;
+// ========== 自动购买系统（全局单例锁）==========
+let autoBuyTokenHistory = new Map();       // key -> [{timestamp, address, chain, symbol, name}]
+let autoBuyPurchasedTokens = new Set();    // 已购买的代币地址
+let autoBuyProcessedKeys = new Set();      // 已处理过的key（永不重试）
+let autoBuyLock = false;                   // 全局购买锁
+let autoBuyLockKey = null;                 // 当前正在购买的key
 
 // ========== 第一列专用索引 ==========
 let firstColumnIndex = new Map();
 
-// ========== 统计更新系统（防抖+批量）==========
+// ========== 本次扫描周期内已检查的key ==========
+let currentScanCheckedKeys = new Set();
+
+// ========== 统计更新系统 ==========
 let pendingStatsUpdate = { autoBuys: 0, detections: 0 };
 let statsUpdateTimer = null;
-const STATS_UPDATE_DELAY = 5000; // 5秒批量更新一次
+const STATS_UPDATE_DELAY = 5000;
 
 function detectLanguage() {
   const browserLang = navigator.language || navigator.userLanguage || "en";
@@ -275,14 +281,17 @@ function getFirstTokenInfo(keys) {
   return null;
 }
 
-function getFirstColumnFirstTokenInfo(keys) {
+function getFirstTokenFromFirstColumnIndex(keys) {
   for (const k of keys) {
     const rec = firstColumnIndex.get(k);
     if (rec) {
       return { 
         chain: rec.firstChain, 
         address: rec.firstAddr.split(":")[1],
-        ageMs: rec.firstAgeMs
+        ageMs: rec.firstAgeMs,
+        slotIndex: rec.firstSlotIndex,
+        symbol: rec.firstSymbol,
+        name: rec.firstName
       };
     }
   }
@@ -294,13 +303,53 @@ function gotoFirstToken(chain, address) {
   window.open(url, "_blank");
 }
 
+// 判断是否更早：ageMs 越大 = 创建时间越早 = 首发
+// 如果 ageMs 相同，slotIndex 越大 = DOM 中越靠后 = 越老（因为新的会插入到顶部）
 function isEarlierThan(tokenAgeMs, tokenSlotIndex, recAgeMs, recSlotIndex) {
   if (tokenAgeMs > recAgeMs) return true;
   if (tokenAgeMs < recAgeMs) return false;
+  // 时间相同时，slotIndex 大的更老（在列表下方）
   return tokenSlotIndex > recSlotIndex;
 }
 
-// ========== 统计更新（防抖批量写入）==========
+// ========== 自动购买锁管理 ==========
+
+function tryAcquireBuyLock(key) {
+  // 已经处理过的key不再处理
+  if (autoBuyProcessedKeys.has(key)) {
+    return false;
+  }
+  // 全局锁被占用
+  if (autoBuyLock) {
+    return false;
+  }
+  // 获取锁
+  autoBuyLock = true;
+  autoBuyLockKey = key;
+  autoBuyProcessedKeys.add(key);
+  console.log(`[GMGN狙击器] 获取购买锁成功: ${key}`);
+  return true;
+}
+
+function releaseBuyLock(success) {
+  const key = autoBuyLockKey;
+  console.log(`[GMGN狙击器] 释放购买锁: ${key}, 成功: ${success}`);
+  
+  // 清理历史记录
+  if (key) {
+    autoBuyTokenHistory.delete(key);
+  }
+  
+  // 延迟释放锁，防止快速连续触发
+  setTimeout(() => {
+    if (autoBuyLockKey === key) {
+      autoBuyLock = false;
+      autoBuyLockKey = null;
+    }
+  }, 3000);
+}
+
+// ========== 统计更新 ==========
 
 function queueStatsUpdate(type) {
   if (type === 'autoBuy') {
@@ -341,7 +390,6 @@ async function flushStatsUpdate() {
     await chrome.storage.sync.set({ stats });
   } catch (e) {
     console.warn('[GMGN狙击器] 统计更新失败:', e.message);
-    // 恢复未保存的数据
     pendingStatsUpdate.autoBuys += toUpdate.autoBuys;
     pendingStatsUpdate.detections += toUpdate.detections;
   }
@@ -349,24 +397,9 @@ async function flushStatsUpdate() {
 
 // ========== 自动购买功能 ==========
 
-function findFirstTokenFromHistory(history) {
-  if (!history || history.length === 0) return null;
-  
-  let firstToken = history[0];
-  for (const token of history) {
-    if (token.ageMs > firstToken.ageMs) {
-      firstToken = token;
-    } else if (token.ageMs === firstToken.ageMs && token.slotIndex > firstToken.slotIndex) {
-      firstToken = token;
-    }
-  }
-  return firstToken;
-}
-
 function findTokenRowInFirstColumn(address) {
   const firstBody = getFirstColumnBody();
   if (!firstBody) {
-    console.log('[GMGN狙击器] 未找到第一列');
     return null;
   }
   
@@ -381,18 +414,17 @@ function findTokenRowInFirstColumn(address) {
     const linkHref = linkEl ? linkEl.getAttribute("href") : "";
     
     if ((href && href.includes(address)) || (linkHref && linkHref.includes(address))) {
-      console.log('[GMGN狙击器] 找到目标代币行:', address.slice(0, 8) + '...');
       return rowEl;
     }
   }
   
-  console.log('[GMGN狙击器] 目标代币不在可见区域:', address.slice(0, 8) + '...');
   return null;
 }
 
 function findAndClickBuyButton(rowEl) {
   if (!rowEl) return Promise.resolve(false);
   
+  // 触发 hover
   const mouseEnterEvent = new MouseEvent('mouseenter', {
     bubbles: true,
     cancelable: true,
@@ -402,128 +434,83 @@ function findAndClickBuyButton(rowEl) {
   
   return new Promise((resolve) => {
     setTimeout(() => {
-      const buyButtonSelectors = [
-        '.BuyButton-continer .QuickBuy_btnForLoading__GcvLL',
-        '.BuyButton-continer div[class*="QuickBuy"]',
-        'div.pointer-events-auto.BuyButton-continer div[class*="rounded-"][class*="cursor-pointer"]',
-        'div[class*="BuyButton"] div[class*="cursor-pointer"]',
-        'div.button-content div[class*="cursor-pointer"][class*="text-primary"]',
-        'div[class*="bg-btn-secondary-buy"]',
-        'div[class*="QuickBuy"]',
-        'div[id="6666666"] div.BuyButton-continer div',
-        'div.pointer-events-auto div[class*="rounded-"][class*="bg-"]'
-      ];
-      
-      let buyButton = null;
       const slot = rowEl.closest('div[data-index]') || rowEl;
       
-      for (const selector of buyButtonSelectors) {
-        buyButton = rowEl.querySelector(selector) || slot.querySelector(selector);
-        if (buyButton) break;
-      }
-      
-      if (!buyButton) {
-        const allDivs = slot.querySelectorAll('div[class*="cursor-pointer"]');
-        for (const div of allDivs) {
-          const text = div.textContent || "";
-          if (text.includes('买入') || text.toLowerCase().includes('buy')) {
-            buyButton = div;
-            break;
-          }
-        }
-      }
+      // 查找购买按钮
+      const buyButton = slot.querySelector('.BuyButton-continer .QuickBuy_btnForLoading__GcvLL') ||
+                        slot.querySelector('.BuyButton-continer div[class*="QuickBuy"]') ||
+                        slot.querySelector('div[class*="bg-btn-secondary-buy"]');
       
       if (buyButton) {
-        console.log('[GMGN狙击器] 找到购买按钮，正在点击...');
-        
-        const buttonContainer = buyButton.closest('div[id="6666666"]');
-        if (buttonContainer) {
-          buttonContainer.style.display = 'flex';
-          buttonContainer.classList.remove('hidden');
-        }
-        
+        console.log('[GMGN狙击器] 找到购买按钮，执行单次点击');
         buyButton.click();
-        
-        const clickEvent = new MouseEvent('click', {
-          bubbles: true,
-          cancelable: true,
-          view: window
-        });
-        buyButton.dispatchEvent(clickEvent);
-        
-        setTimeout(() => buyButton.click(), 100);
-        
         resolve(true);
       } else {
         console.log('[GMGN狙击器] 未找到购买按钮');
         resolve(false);
       }
-    }, 100);
+    }, 150);
   });
 }
 
-async function findAndBuyTokenInFirstColumn(address) {
-  const rowEl = findTokenRowInFirstColumn(address);
-  
-  if (rowEl) {
-    return await findAndClickBuyButton(rowEl);
-  }
-  
-  return false;
-}
-
 async function executeAutoBuy(firstTokenInfo, triggerKey) {
-  if (autoBuyLock) {
-    console.log('[GMGN狙击器] 自动购买已锁定，跳过...');
-    return false;
-  }
-  
   const addrKey = `${firstTokenInfo.chain}:${firstTokenInfo.address}`;
   
   if (autoBuyPurchasedTokens.has(addrKey)) {
     console.log('[GMGN狙击器] 该代币已购买过:', addrKey);
+    releaseBuyLock(true);
     return false;
   }
   
-  autoBuyLock = true;
+  console.log('[GMGN狙击器] ========================================');
+  console.log('[GMGN狙击器] 执行自动购买首发代币');
+  console.log('[GMGN狙击器] 触发Key:', triggerKey);
+  console.log('[GMGN狙击器] 首发地址:', firstTokenInfo.address);
+  console.log('[GMGN狙击器] 代币名称:', firstTokenInfo.symbol || firstTokenInfo.name || 'Unknown');
+  console.log('[GMGN狙击器] 代币年龄:', firstTokenInfo.ageMs, 'ms');
+  console.log('[GMGN狙击器] ========================================');
   
   try {
-    console.log('[GMGN狙击器] 执行自动购买首发代币:', firstTokenInfo.address.slice(0, 12) + '...');
-    console.log('[GMGN狙击器] 代币年龄:', firstTokenInfo.ageMs, 'ms');
+    const rowEl = findTokenRowInFirstColumn(firstTokenInfo.address);
     
-    const success = await findAndBuyTokenInFirstColumn(firstTokenInfo.address);
+    if (!rowEl) {
+      console.log('[GMGN狙击器] 首发代币不在可见区域');
+      releaseBuyLock(false);
+      return false;
+    }
+    
+    const success = await findAndClickBuyButton(rowEl);
     
     if (success) {
       autoBuyPurchasedTokens.add(addrKey);
-      
-      // 使用防抖批量更新
       queueStatsUpdate('autoBuy');
-      
-      showAutoBuyNotification(firstTokenInfo, triggerKey);
-      
-      console.log('[GMGN狙击器] 自动购买首发代币成功!');
-      return true;
+      showAutoBuyNotification(firstTokenInfo);
+      console.log('[GMGN狙击器] ✅ 自动购买成功!');
     } else {
-      console.log('[GMGN狙击器] 未能完成购买');
+      console.log('[GMGN狙击器] ❌ 购买失败');
     }
     
+    releaseBuyLock(success);
+    return success;
+  } catch (e) {
+    console.error('[GMGN狙击器] 购买出错:', e);
+    releaseBuyLock(false);
     return false;
-  } finally {
-    setTimeout(() => {
-      autoBuyLock = false;
-    }, 1000);
   }
 }
 
-function showAutoBuyNotification(tokenInfo, triggerKey) {
+function showAutoBuyNotification(tokenInfo) {
+  const tokenName = tokenInfo.symbol || tokenInfo.name || 'Unknown';
+  const tokenUrl = `https://gmgn.ai/${tokenInfo.chain}/token/${tokenInfo.address}`;
+  
   const notification = document.createElement('div');
   notification.className = 'gmgn-sniper-notification';
   notification.innerHTML = `
     <div style="display: flex; align-items: center; gap: 8px;">
       <span style="font-size: 20px;">⚡</span>
       <div>
-        <div style="font-weight: bold;">${t('autoBought')}</div>
-        <div style="font-size: 12px; opacity: 0.8;">${tokenInfo.address.slice(0, 12)}...</div>
+        <div style="font-weight: bold;">${t('autoBought')} ${tokenName}</div>
+        <div style="font-size: 12px; opacity: 0.8;">${t('clickToView')}</div>
       </div>
     </div>
   `;
@@ -540,7 +527,26 @@ function showAutoBuyNotification(tokenInfo, triggerKey) {
     box-shadow: 0 4px 20px rgba(0, 200, 83, 0.4);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     animation: gmgnSlideIn 0.3s ease-out;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
   `;
+  
+  // 添加悬停效果
+  notification.addEventListener('mouseenter', () => {
+    notification.style.transform = 'scale(1.02)';
+    notification.style.boxShadow = '0 6px 24px rgba(0, 200, 83, 0.5)';
+  });
+  
+  notification.addEventListener('mouseleave', () => {
+    notification.style.transform = 'scale(1)';
+    notification.style.boxShadow = '0 4px 20px rgba(0, 200, 83, 0.4)';
+  });
+  
+  // 点击跳转到代币详情页
+  notification.addEventListener('click', () => {
+    window.open(tokenUrl, '_blank');
+    notification.remove();
+  });
   
   if (!document.getElementById('gmgn-sniper-styles')) {
     const style = document.createElement('style');
@@ -560,20 +566,36 @@ function showAutoBuyNotification(tokenInfo, triggerKey) {
     notification.style.opacity = '0';
     notification.style.transition = 'opacity 0.5s';
     setTimeout(() => notification.remove(), 500);
-  }, 3000);
+  }, 5000);
 }
 
-function checkAutoBuyCondition(keys, token, isInFirstColumn) {
+// ========== 自动购买条件检查（每个扫描周期只检查一次）==========
+
+function processAutoBuyForScan(allNewTokens) {
   if (!cfg.autoBuyEnabled || !cfg.enabled) return;
-  if (!isInFirstColumn) return;
+  if (autoBuyLock) return;
   
   const now = Date.now();
   const timeWindowMs = cfg.autoBuyTimeWindow * 1000;
   
-  for (const key of keys) {
-    if (autoBuyTriggeredKeys.has(key)) {
-      continue;
+  // 按 key 分组新代币
+  const keyToNewTokens = new Map();
+  
+  for (const { token, keys } of allNewTokens) {
+    for (const key of keys) {
+      if (autoBuyProcessedKeys.has(key)) continue;
+      
+      if (!keyToNewTokens.has(key)) {
+        keyToNewTokens.set(key, []);
+      }
+      keyToNewTokens.get(key).push(token);
     }
+  }
+  
+  // 更新历史记录并检查条件
+  for (const [key, newTokens] of keyToNewTokens) {
+    if (autoBuyProcessedKeys.has(key)) continue;
+    if (autoBuyLock) break; // 已经有购买在进行
     
     if (!autoBuyTokenHistory.has(key)) {
       autoBuyTokenHistory.set(key, []);
@@ -581,37 +603,51 @@ function checkAutoBuyCondition(keys, token, isInFirstColumn) {
     
     const history = autoBuyTokenHistory.get(key);
     
-    history.push({
-      timestamp: now,
-      address: token.address,
-      chain: token.chain,
-      ageMs: token.ageMs,
-      slotIndex: token.slotIndex
-    });
+    // 添加新代币到历史（去重）
+    for (const token of newTokens) {
+      const exists = history.some(h => h.address === token.address);
+      if (!exists) {
+        history.push({
+          timestamp: now,
+          address: token.address,
+          chain: token.chain,
+          symbol: token.symbol,
+          name: token.name
+        });
+      }
+    }
     
+    // 过滤时间窗口
     const validHistory = history.filter(h => now - h.timestamp <= timeWindowMs);
     autoBuyTokenHistory.set(key, validHistory);
     
+    // 计算唯一地址
     const uniqueAddresses = new Set(validHistory.map(h => h.address));
     
-    console.log(`[GMGN狙击器] 同名组 ${key}: ${uniqueAddresses.size}/${cfg.autoBuyMinDuplicates} 个代币在 ${cfg.autoBuyTimeWindow}s 内`);
+    console.log(`[GMGN狙击器] 检查 ${key}: ${uniqueAddresses.size}/${cfg.autoBuyMinDuplicates} (窗口: ${cfg.autoBuyTimeWindow}s)`);
     
     if (uniqueAddresses.size >= cfg.autoBuyMinDuplicates) {
-      console.log(`[GMGN狙击器] ⚡ 触发自动购买! 同名组: ${key}`);
-      
-      // 使用防抖批量更新
-      queueStatsUpdate('detection');
-      
-      const firstToken = findFirstTokenFromHistory(validHistory);
-      
-      if (firstToken) {
-        console.log(`[GMGN狙击器] 首发代币: ${firstToken.address.slice(0, 12)}..., 年龄: ${firstToken.ageMs}ms`);
-        executeAutoBuy(firstToken, key);
+      // 尝试获取锁
+      if (!tryAcquireBuyLock(key)) {
+        console.log(`[GMGN狙击器] 无法获取锁: ${key}`);
+        continue;
       }
       
-      autoBuyTriggeredKeys.add(key);
-      autoBuyTokenHistory.delete(key);
-      break;
+      console.log(`[GMGN狙击器] ⚡ 触发自动购买! key: ${key}`);
+      queueStatsUpdate('detection');
+      
+      // 获取首发代币
+      const firstToken = getFirstTokenFromFirstColumnIndex([key]);
+      
+      if (firstToken) {
+        console.log(`[GMGN狙击器] 首发: ${firstToken.address.slice(0, 12)}... (age: ${firstToken.ageMs}ms)`);
+        executeAutoBuy(firstToken, key);
+      } else {
+        console.log(`[GMGN狙击器] 未找到首发代币`);
+        releaseBuyLock(false);
+      }
+      
+      break; // 一次扫描只触发一个购买
     }
   }
 }
@@ -621,7 +657,7 @@ function cleanAutoBuyHistory() {
   const maxAge = 300000;
   
   for (const [key, history] of autoBuyTokenHistory) {
-    if (autoBuyTriggeredKeys.has(key)) {
+    if (autoBuyProcessedKeys.has(key)) {
       autoBuyTokenHistory.delete(key);
       continue;
     }
@@ -811,9 +847,7 @@ function computeFirstIndex(tokens) {
   }
 }
 
-function computeFirstColumnIndex(tokens) {
-  firstColumnIndex.clear();
-
+function updateFirstColumnIndex(tokens) {
   for (const { token, addrKey, keys, canCompare } of tokens) {
     if (!canCompare) continue;
 
@@ -825,7 +859,9 @@ function computeFirstColumnIndex(tokens) {
           firstAddr: addrKey,
           firstAgeMs: token.ageMs,
           firstSlotIndex: token.slotIndex,
-          firstChain: token.chain
+          firstChain: token.chain,
+          firstSymbol: token.symbol,
+          firstName: token.name
         });
       }
     }
@@ -861,7 +897,7 @@ function validateStateChange(addrKey, keys, newIsFirst) {
   return true;
 }
 
-function applyMarkersWithLock(tokens, isInFirstColumn) {
+function applyMarkersWithLock(tokens, isInFirstColumn, newTokensCollector) {
   let needsRelayout = false;
   const newKnownAddresses = new Set();
   const stateChanges = [];
@@ -874,8 +910,9 @@ function applyMarkersWithLock(tokens, isInFirstColumn) {
       isFirst = isTokenFirstInIndex(addrKey, keys, buildIndex);
     }
 
-    if (isNew && cfg.autoBuyEnabled && isInFirstColumn) {
-      checkAutoBuyCondition(keys, token, isInFirstColumn);
+    // 收集新代币用于自动购买检测（只收集第一列的）
+    if (isNew && isInFirstColumn && cfg.autoBuyEnabled) {
+      newTokensCollector.push({ token, keys });
     }
 
     if (isNew) {
@@ -966,28 +1003,6 @@ function relayoutBody(body) {
 
 // ========== 扫描流程 ==========
 
-function scanBody(body, generation) {
-  if (generation !== scanGeneration) return;
-
-  const isInFirstColumn = isFirstColumn(body);
-  const tokens = collectTokens(body);
-  
-  computeFirstIndex(tokens);
-  
-  if (isInFirstColumn) {
-    computeFirstColumnIndex(tokens);
-  }
-  
-  const needsRelayout = applyMarkersWithLock(tokens, isInFirstColumn);
-  
-  renderIndex = new Map(buildIndex);
-  renderDupKeys = new Set(buildDupKeys);
-
-  if (needsRelayout || cfg.showMode !== "all") {
-    relayoutBody(body);
-  }
-}
-
 function scanAllColumns() {
   if (!cfg.enabled) return;
   
@@ -1002,8 +1017,37 @@ function scanAllColumns() {
 
   requestAnimationFrame(() => {
     try {
-      document.querySelectorAll(".g-table-body").forEach((body) => scanBody(body, gen));
+      const allBodies = document.querySelectorAll(".g-table-body");
+      const newTokensFromFirstColumn = [];
       
+      allBodies.forEach((body) => {
+        if (gen !== scanGeneration) return;
+        
+        const isInFirstColumn = isFirstColumn(body);
+        const tokens = collectTokens(body);
+        
+        computeFirstIndex(tokens);
+        
+        if (isInFirstColumn) {
+          updateFirstColumnIndex(tokens);
+        }
+        
+        const needsRelayout = applyMarkersWithLock(tokens, isInFirstColumn, newTokensFromFirstColumn);
+        
+        renderIndex = new Map(buildIndex);
+        renderDupKeys = new Set(buildDupKeys);
+
+        if (needsRelayout || cfg.showMode !== "all") {
+          relayoutBody(body);
+        }
+      });
+      
+      // 所有列处理完后，统一处理自动购买
+      if (newTokensFromFirstColumn.length > 0 && cfg.autoBuyEnabled) {
+        processAutoBuyForScan(newTokensFromFirstColumn);
+      }
+      
+      // 定期清理
       if (Math.random() < 0.1) {
         cleanExpiredStates();
         cleanAutoBuyHistory();
@@ -1030,13 +1074,20 @@ function resetAll() {
   elementStateCache = new WeakMap();
   autoBuyTokenHistory.clear();
   autoBuyPurchasedTokens.clear();
-  autoBuyTriggeredKeys.clear();
 
   document.querySelectorAll(".gmgn-marker-container").forEach((el) => el.remove());
   document.querySelectorAll(".gmgn-slot-hidden").forEach((slot) => {
     slot.classList.remove("gmgn-slot-hidden");
     slot.style.cssText = "height: 144px;";
   });
+}
+
+function fullReset() {
+  resetAll();
+  autoBuyProcessedKeys.clear();
+  autoBuyLock = false;
+  autoBuyLockKey = null;
+  console.log('[GMGN狙击器] 完全重置');
 }
 
 async function loadCfg() {
@@ -1137,20 +1188,16 @@ function initObserver() {
 
   window.addEventListener("resize", () => cfg.enabled && scheduleScan(), { passive: true });
 
-  if (cfg.enabled) {
-    console.log('[GMGN狙击器] 已启动');
-    if (cfg.autoBuyEnabled) {
-      console.log(`[GMGN狙击器] ⚡ 自动购买已启用 - ${cfg.autoBuyTimeWindow}秒内出现${cfg.autoBuyMinDuplicates}个同名代币时自动购买首发`);
-    }
+  console.log('[GMGN狙击器] 已启动');
+  if (cfg.autoBuyEnabled) {
+    console.log(`[GMGN狙击器] ⚡ 自动购买已启用 - ${cfg.autoBuyTimeWindow}秒内${cfg.autoBuyMinDuplicates}个同名代币`);
   }
 
   if (cfg.enabled) scanAllColumns();
 }
 
-// 页面卸载时保存未完成的统计
 window.addEventListener('beforeunload', () => {
   if (pendingStatsUpdate.autoBuys > 0 || pendingStatsUpdate.detections > 0) {
-    // 使用 sendBeacon 尝试保存（不一定成功）
     flushStatsUpdate();
   }
 });
@@ -1167,6 +1214,13 @@ window.addEventListener('beforeunload', () => {
     if (changes.__gmgn_cmd?.newValue?.type === "reset") {
       await loadCfg();
       resetAll();
+      if (cfg.enabled) scanAllColumns();
+      return;
+    }
+    
+    if (changes.__gmgn_cmd?.newValue?.type === "fullReset") {
+      await loadCfg();
+      fullReset();
       if (cfg.enabled) scanAllColumns();
       return;
     }

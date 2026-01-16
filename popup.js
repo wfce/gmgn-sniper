@@ -20,7 +20,7 @@ const DEFAULTS = {
 
 const i18nUI = {
   en: {
-    pageTitle: "GMGN Sniper",
+    pageTitle: "GMGN First Token Sniper",
     enableLabel: "Enable",
     languageLabel: "Language",
     langAuto: "Auto",
@@ -63,7 +63,7 @@ const i18nUI = {
     resetDone: "✓ Reset complete"
   },
   zh: {
-    pageTitle: "GMGN 狙击器",
+    pageTitle: "GMGN首发代币狙击器",
     enableLabel: "启用",
     languageLabel: "语言",
     langAuto: "自动",

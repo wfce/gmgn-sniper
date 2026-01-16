@@ -9,7 +9,7 @@ const DEFAULTS = {
 // 多语言文本
 const i18n = {
   en: {
-    title: "GMGN Same-Name First Launch Filter",
+    title: "GMGN First Token Sniper",
     timeWindow: "Time Window (minutes)",
     timeWindowHint: "Only compare tokens within this time range (ageMs ≤ this value)",
     matchMode: "Match Mode",
@@ -32,7 +32,7 @@ const i18n = {
     reset: "Reset Data"
   },
   zh: {
-    title: "GMGN 同名首发过滤器",
+    title: "GMGN首发代币狙击器",
     timeWindow: "时间窗口（分钟）",
     timeWindowHint: "仅比较此时间范围内的代币（ageMs ≤ 此值）",
     matchMode: "匹配模式",
